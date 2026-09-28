@@ -1,0 +1,6 @@
+.env
+.event_cache.json
+menus.db
+__pycache__/
+.venv/
+logs/
