@@ -1,10 +1,10 @@
 import os
+import sqlite3
 import tempfile
 import types
 import unittest
 from pathlib import Path
-from typing import cast
-from unittest.mock import AsyncMock, patch
+from typing import Any, cast
 
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -37,9 +37,9 @@ class MenuDbTests(unittest.TestCase):
         old_value = os.environ.get("ADMIN_IDS")
         os.environ["ADMIN_IDS"] = "9001, 9002"
         try:
-            self.assertTrue(Index.is_menu_admin(types.SimpleNamespace(id=9001)))# type: ignore
-            self.assertTrue(Index.is_menu_admin(types.SimpleNamespace(id=9002)))# type: ignore
-            self.assertFalse(Index.is_menu_admin(types.SimpleNamespace(id=1234)))# type: ignore
+            self.assertTrue(Index.is_menu_admin(cast(Any, types.SimpleNamespace(id=9001))))
+            self.assertTrue(Index.is_menu_admin(cast(Any, types.SimpleNamespace(id=9002))))
+            self.assertFalse(Index.is_menu_admin(cast(Any, types.SimpleNamespace(id=1234))))
         finally:
             if old_value is None:
                 os.environ.pop("ADMIN_IDS", None)
@@ -57,127 +57,71 @@ class MenuDbTests(unittest.TestCase):
         self.assertTrue(all(field.inline for field in first_page.fields))
         self.assertEqual(first_page.fields[0].value, "메뉴 1")
         self.assertEqual(second_page.fields[0].value, "메뉴 21")
-        self.assertIn("페이지 1 / 2", first_page.footer.text)# type: ignore
+        self.assertIn("페이지 1 / 2", first_page.footer.text or "")
 
+    def test_random_menu_only_uses_the_selected_category(self):
+        Index.initialize_menu_db()
+        self.assertTrue(Index.add_menu(1, "김치찌개", 101, "일반 음식"))
+        self.assertTrue(Index.add_menu(1, "케이크", 102, "디저트"))
+        self.assertTrue(Index.add_menu(1, "민트초코 라면", 103, "괴랄한 음식"))
 
-class QuizDbTests(unittest.TestCase):
-    def setUp(self):
-        self.temp_dir = tempfile.TemporaryDirectory()
-        Index.MENU_DB_FILE = Path(self.temp_dir.name) / "menus.db"
+        self.assertEqual(Index.get_random_menu(1, "디저트"), ("케이크", 1))
+        self.assertEqual(Index.get_random_menu(1, "괴랄한 음식"), ("민트초코 라면", 1))
+        self.assertEqual(Index.get_random_menu(1), ("김치찌개", 1))
+        self.assertEqual(Index.get_random_menu(1, "없는 분류"), (None, 0))
+
+    def test_initialize_menu_db_migrates_existing_menus_to_regular_food(self):
+        connection = sqlite3.connect(self.db_path)
+        connection.execute(
+            """
+            CREATE TABLE menus (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                owner_id INTEGER NOT NULL DEFAULT 0,
+                menu TEXT NOT NULL,
+                UNIQUE(guild_id, menu)
+            )
+            """
+        )
+        connection.execute(
+            "INSERT INTO menus (guild_id, owner_id, menu) VALUES (?, ?, ?)",
+            (1, 101, "기존 메뉴"),
+        )
+        connection.commit()
+        connection.close()
+
         Index.initialize_menu_db()
 
-    def tearDown(self):
-        self.temp_dir.cleanup()
+        self.assertEqual(Index.get_random_menu(1), ("기존 메뉴", 1))
+        self.assertEqual(Index.get_random_menu(1, "디저트"), (None, 0))
 
-    def test_level_cost_increases_at_level_tiers(self):
-        self.assertEqual(Index.points_for_next_level(0), 20)
-        self.assertEqual(Index.points_for_next_level(49), 1000)
-        self.assertEqual(Index.points_for_next_level(50), 1050)
-        self.assertEqual(Index.points_for_next_level(99), 3500)
-        self.assertEqual(Index.points_for_next_level(100), 3600)
-        self.assertEqual(Index.points_for_next_level(101), 3700)
 
-    def test_quiz_cooldown_is_shared_and_expires_after_thirty_minutes(self):
-        old_cooldown = Index.quiz_cooldown_until
-        old_duration = Index.QUIZ_COOLDOWN_SECONDS
-        try:
-            Index.quiz_cooldown_until = None
-            Index.QUIZ_COOLDOWN_SECONDS = 1800
-
-            self.assertEqual(Index.claim_quiz_cooldown(now=1000), 0)
-            self.assertEqual(Index.claim_quiz_cooldown(now=1100), 1700)
-            self.assertEqual(Index.claim_quiz_cooldown(now=2800), 0)
-        finally:
-            Index.quiz_cooldown_until = old_cooldown
-            Index.QUIZ_COOLDOWN_SECONDS = old_duration
-
-    def test_level_embed_shows_level_and_remaining_points(self):
-        embed = Index.make_level_embed("테스트", (2, 30, 60))
-
-        self.assertEqual(embed.title, "테스트님의 레벨 정보")
-        self.assertEqual(embed.fields[0].value, "Lv 2")
-        self.assertEqual(embed.fields[1].value, "30 / 60p")
-        self.assertEqual(embed.fields[2].value, "30p · 진행도 50%")
-
-    def test_quiz_completion_embed_shows_solver_name(self):
-        embed = Index.make_quiz_embed(
-            "숫자 3을 한글로?",
-            ["3", "삼", "셋"],
-            1,
-            0,
-            40,
-            revealed=True,
-            completed=True,
-            solver_name="테스트 사용자",
+class MenuCategoryCommandTests(unittest.TestCase):
+    def test_add_and_recommend_commands_expose_all_menu_categories(self):
+        command_categories = (
+            (Index.add_menu_command, Index.MENU_CATEGORIES),
+            (Index.recommend_menu_command, Index.MENU_RECOMMEND_CATEGORIES),
         )
+        for command, expected_categories in command_categories:
+            with self.subTest(command=command.name):
+                category_option = next(
+                    option for option in command.parameters if option.name == "category"
+                )
+                self.assertEqual(
+                    [choice.value for choice in category_option.choices],
+                    list(expected_categories),
+                )
 
-        self.assertEqual(embed.title, "퀴즈 완료")
-        self.assertIn("테스트 사용자", {field.value for field in embed.fields})
 
-    def test_public_quiz_view_allows_another_user_to_participate(self):
-        import asyncio
+class CommandLoggingTests(unittest.TestCase):
+    def test_command_log_helper_uses_consistent_fields(self):
+        user = types.SimpleNamespace(id=12345, __str__=lambda self: "TestUser")
 
-        view = Index.QuizView(
-            1,
-            202,
-            1,
-            "숫자 3을 한글로?",
-            "하나 다음",
-            ["3", "삼", "셋"],
-            (0, 0, 20),
-            public=True,
-        )
-        interaction = cast(
-            Index.discord.Interaction,
-            types.SimpleNamespace(user=types.SimpleNamespace(id=303)),
-        )
+        with self.assertLogs(Index.logger, level="INFO") as captured:
+            Index.log_command_trigger("테스트", cast(Any, user))
 
-        self.assertTrue(asyncio.run(view._check_user(interaction)))
-
-    def test_quiz_abandonment_has_a_distinct_embed(self):
-        embed = Index.make_quiz_abandoned_embed("숫자 3을 한글로?", ["3", "삼"], "테스트 사용자")
-
-        self.assertEqual(embed.title, "퀴즈 포기")
-        self.assertIsNotNone(embed.description)
-        self.assertIn("테스트 사용자님이 퀴즈를 포기했습니다.", embed.description or "")
-        self.assertEqual(embed.fields[0].name, "정답")
-
-    def test_quiz_aliases_are_saved_and_reward_is_only_awarded_once(self):
-        question_id = Index.add_quiz_question(
-            1,
-            "숫자 3을 한글로?",
-            "하나 다음",
-            ["3", "삼", "셋"],
-            101,
-        )
-
-        self.assertEqual(
-            Index.get_random_quiz(1, 202),
-            (question_id, "숫자 3을 한글로?", "하나 다음", ["3", "삼", "셋"]),
-        )
-        self.assertEqual(Index.normalize_quiz_answer(" 세  셋 "), "세셋")
-        self.assertEqual(Index.normalize_quiz_answer(" Some Answer "), "someanswer")
-
-        with patch.object(Index, "QUIZ_REWARD_POINTS", 20):
-            self.assertEqual(Index.award_quiz_points(1, question_id, 202), (True, 1, 0, 40))
-            self.assertEqual(Index.award_quiz_points(1, question_id, 202), (False, 1, 0, 40))
-            self.assertEqual(Index.award_quiz_points(1, question_id, 303), (True, 1, 0, 40))
-            self.assertIsNone(Index.get_random_quiz(1, 202))
-            self.assertIsNone(Index.get_random_quiz(1, 303))
-
-    def test_reset_quiz_questions_only_clears_the_selected_guild(self):
-        first_question = Index.add_quiz_question(1, "문제 1", "힌트", ["답"], 101)
-        second_question = Index.add_quiz_question(2, "문제 2", "힌트", ["답"], 202)
-        with patch.object(Index, "QUIZ_REWARD_POINTS", 20):
-            Index.award_quiz_points(1, first_question, 303)
-
-        self.assertEqual(Index.clear_quiz_questions(1), 1)
-        self.assertIsNone(Index.get_random_quiz(1, 303))
-        self.assertEqual(
-            Index.get_random_quiz(2, 404),
-            (second_question, "문제 2", "힌트", ["답"]),
-        )
-        self.assertEqual(Index.get_user_level(1, 303), (1, 0, 40))
+        self.assertIn("CommandTriggered: command=테스트", captured.output[0])
+        self.assertIn("user_id=12345", captured.output[0])
 
 
 class BotRegistrationTests(unittest.TestCase):
@@ -189,46 +133,19 @@ class BotRegistrationTests(unittest.TestCase):
             import asyncio
             asyncio.run(bot.setup_hook())
             self.assertIsNotNone(bot.get_command("티그"))
-            self.assertIsNotNone(bot.tree.get_command("퀴즈"))
-            self.assertIsNotNone(bot.tree.get_command("문제출제"))
-            self.assertIsNotNone(bot.tree.get_command("내레벨"))
-            self.assertIsNotNone(bot.tree.get_command("문제초기화"))
+            self.assertIsNotNone(bot.get_command("cnst:suro!saveLog"))
+            self.assertIsNotNone(bot.get_command("saveLog"))
+            self.assertIsNotNone(bot.tree.get_command("레벨"))
+            self.assertIsNotNone(bot.tree.get_command("인벤토리"))
+            self.assertIsNotNone(bot.tree.get_command("골디상점"))
+            self.assertIsNotNone(bot.tree.get_command("유저레벨초기화"))
+            self.assertIsNotNone(bot.tree.get_command("레벨초기화"))
+            self.assertIsNotNone(bot.tree.get_command("레벨차감"))
         finally:
             if old_time is not None:
                 os.environ["AUTO_MESSAGE_TIME"] = old_time
             if old_text is not None:
                 os.environ["AUTO_MESSAGE_TEXT"] = old_text
-
-
-class CommandSyncTests(unittest.TestCase):
-    def test_global_commands_are_synced_instead_of_cleared(self):
-        import asyncio
-
-        bot = Index.ComicWorldBot(None)
-        with patch.object(bot.tree, "sync", new_callable=AsyncMock) as sync:
-            asyncio.run(bot.sync_commands_with_retry())
-
-        sync.assert_awaited_once_with()
-        self.assertTrue(bot.commands_synced)
-
-
-class InteractionLoggingTests(unittest.TestCase):
-    def test_menu_list_attempt_is_logged_before_command_execution(self):
-        import asyncio
-
-        bot = Index.ComicWorldBot(None)
-        interaction = types.SimpleNamespace(
-            type=Index.discord.InteractionType.application_command,
-            command=None,
-            data={"name": "메뉴목록"},
-            user=types.SimpleNamespace(id=1234),
-        )
-
-        with self.assertLogs(Index.logger.name, level="INFO") as captured:
-            asyncio.run(bot.on_interaction(interaction))# type: ignore
-
-        self.assertTrue(any("command:메뉴목록" in message for message in captured.output))
-        self.assertTrue(any("user_id=1234" in message for message in captured.output))
 
 
 class StatusHelpersTests(unittest.TestCase):
